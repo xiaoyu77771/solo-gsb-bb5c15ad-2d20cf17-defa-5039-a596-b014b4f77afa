@@ -8,6 +8,10 @@
 3. 这些路由构成等价多路径（ECMP）结果，其 ``next_hop`` 按 **routes 输入
    顺序去重**后返回；未命中任何路由的目标标记为 ``unreachable``。
 
+:func:`failover_routes` 在此基础上模拟下一跳失效：先在完整路由表上解析
+一次，再移除失败下一跳对应的**全部路由**并重新执行完整的选择流程
+（允许回退到更高 metric 或更短前缀），逐目标给出 before/after/impact。
+
 全程只做 32 位整数比较，**不逐地址展开网段**，可安全处理 ``0.0.0.0/0``。
 """
 from __future__ import annotations
@@ -25,12 +29,22 @@ ROUTES_MAX = 1000
 TARGETS_MIN = 1
 TARGETS_MAX = 500
 
+#: 单次请求允许的失败下一跳数量上限（与路由条数上限一致）
+FAILED_NEXT_HOPS_MAX = ROUTES_MAX
+
 #: metric 取值范围
 METRIC_MIN = 0
 METRIC_MAX = 65535
 
 REACHABLE = "reachable"
 UNREACHABLE = "unreachable"
+
+#: 故障切换影响分类
+UNCHANGED = "unchanged"
+ECMP_REDUCED = "ecmp_reduced"
+REROUTED = "rerouted"
+#: 影响分类全集（unreachable 复用状态值）
+IMPACTS = (UNCHANGED, ECMP_REDUCED, REROUTED, UNREACHABLE)
 
 
 class InvalidIPv4AddressError(ValueError):
@@ -47,6 +61,18 @@ class DuplicateTargetsError(ValueError):
     def __init__(self, duplicates: list[dict]) -> None:
         self.duplicates = duplicates
         super().__init__(f"{len(duplicates)} 个重复目标地址")
+
+
+class DuplicateNextHopsError(ValueError):
+    """失败下一跳重复。
+
+    ``duplicates`` 给出每个重复下一跳（按首次出现排序），形如
+    ``{"next_hop": "10.0.0.1", "indexes": [0, 2]}``。
+    """
+
+    def __init__(self, duplicates: list[dict]) -> None:
+        self.duplicates = duplicates
+        super().__init__(f"{len(duplicates)} 个重复失败下一跳")
 
 
 def parse_address_v4(text: str) -> tuple[int, str]:
@@ -87,34 +113,39 @@ def normalize_metric(metric: object) -> int:
     return metric
 
 
-def resolve_routes(
+def _collect_duplicates(parsed_items: list[tuple[int, str]], key: str) -> list[dict]:
+    """从 ``(地址整数, 规范化文本)`` 列表中收集重复项（按首次出现排序）。
+
+    每条形如 ``{key: 规范化文本, "indexes": [全部出现位置]}``。
+    """
+    positions: dict[int, list[int]] = defaultdict(list)
+    first_seen: list[int] = []
+    for index, (value, _text) in enumerate(parsed_items):
+        if value not in positions:
+            first_seen.append(value)
+        positions[value].append(index)
+    return [
+        {key: parsed_items[positions[value][0]][1], "indexes": positions[value]}
+        for value in first_seen
+        if len(positions[value]) > 1
+    ]
+
+
+def _parse_route_entries(
     routes: Sequence[tuple[str, str, int]],
-    targets: Sequence[str],
-) -> dict:
-    """解析一组目标地址的最长前缀、最低 metric 等价下一跳。
+) -> tuple[list[dict], dict[str, int]]:
+    """校验并解析路由列表。
 
-    ``routes`` 每项为 ``(cidr, next_hop, metric)``，允许为空（此时所有目标
-    均不可达）；``targets`` 每项为单个严格 IPv4 地址，**必须唯一**。
-
-    返回可直接 JSON 序列化的字典：``results`` 严格保持 targets 输入顺序；
-    命中项给出 ``status="reachable"``、共同命中的规范化 ``matched_cidr``、
-    ``metric`` 与按 routes 输入顺序去重的 ``next_hops``；未命中项为
-    ``status="unreachable"``、其余字段为 ``None`` / ``[]``。
-    ``summary.next_hop_counts`` 汇总每个 next_hop 命中的**目标数**（同一
-    ECMP 结果的各下一跳分别计一次），按 next_hop 在 routes 中的首次出现
-    位置排序。目标重复时抛出 :class:`DuplicateTargetsError`，非法 CIDR /
-    地址 / metric 抛出对应 ValueError 子类。
+    返回 ``(parsed_routes, hop_first_index)``：``parsed_routes`` 每项为含
+    整数区间、前缀长度、metric 与下一跳的字典（保持输入顺序）；
+    ``hop_first_index`` 记录每个规范化下一跳在 routes 中的最早输入序号，
+    用于汇总排序。
     """
     if not 0 <= len(routes) <= ROUTES_MAX:
         raise ValueError(f"路由数必须在 0～{ROUTES_MAX} 之间，实际 {len(routes)}")
-    if not TARGETS_MIN <= len(targets) <= TARGETS_MAX:
-        raise ValueError(
-            f"目标数必须在 {TARGETS_MIN}～{TARGETS_MAX} 之间，实际 {len(targets)}"
-        )
 
     parsed_routes: list[dict] = []
-    # 每个 next_hop 在 routes 中的最早输入序号，用于汇总排序
-    hop_first_index: dict[int, int] = {}
+    hop_first_index: dict[str, int] = {}
     for index, (raw_cidr, raw_next_hop, raw_metric) in enumerate(routes):
         start, end, cidr = parse_cidr_v4(raw_cidr)
         hop_int, next_hop = parse_address_v4(raw_next_hop)
@@ -130,34 +161,51 @@ def resolve_routes(
                 "next_hop": next_hop,
             }
         )
-        hop_first_index.setdefault(hop_int, index)
+        hop_first_index.setdefault(next_hop, index)
+    return parsed_routes, hop_first_index
 
-    parsed_targets: list[tuple[int, str]] = []
-    positions: dict[int, list[int]] = defaultdict(list)
-    first_seen: list[int] = []
-    for index, raw_target in enumerate(targets):
-        value, text = parse_address_v4(raw_target)
-        parsed_targets.append((value, text))
-        if value not in positions:
-            first_seen.append(value)
-        positions[value].append(index)
 
-    duplicates = [
-        {"target": parsed_targets[positions[value][0]][1],
-         "indexes": positions[value]}
-        for value in first_seen
-        if len(positions[value]) > 1
-    ]
+def _parse_target_list(targets: Sequence[str]) -> list[tuple[int, str]]:
+    """校验目标列表规模与唯一性，返回 ``(地址整数, 规范化文本)`` 列表。"""
+    if not TARGETS_MIN <= len(targets) <= TARGETS_MAX:
+        raise ValueError(
+            f"目标数必须在 {TARGETS_MIN}～{TARGETS_MAX} 之间，实际 {len(targets)}"
+        )
+    parsed_targets = [parse_address_v4(raw) for raw in targets]
+    duplicates = _collect_duplicates(parsed_targets, "target")
     if duplicates:
         raise DuplicateTargetsError(duplicates)
+    return parsed_targets
 
+
+def _parse_failed_next_hops(
+    failed_next_hops: Sequence[str],
+) -> list[tuple[int, str]]:
+    """校验失败下一跳列表规模与唯一性，返回 ``(地址整数, 规范化文本)`` 列表。"""
+    if not 0 <= len(failed_next_hops) <= FAILED_NEXT_HOPS_MAX:
+        raise ValueError(
+            f"失败下一跳数必须在 0～{FAILED_NEXT_HOPS_MAX} 之间，"
+            f"实际 {len(failed_next_hops)}"
+        )
+    parsed = [parse_address_v4(raw) for raw in failed_next_hops]
+    duplicates = _collect_duplicates(parsed, "next_hop")
+    if duplicates:
+        raise DuplicateNextHopsError(duplicates)
+    return parsed
+
+
+def _resolve_targets(
+    parsed_routes: Sequence[dict],
+    parsed_targets: Sequence[tuple[int, str]],
+) -> list[dict]:
+    """对每个目标执行 LPM + 最低 metric + ECMP 选择。
+
+    返回与 ``parsed_targets`` 等长的结果列表，每项含
+    ``status`` / ``matched_cidr`` / ``metric`` / ``next_hops``
+    （不含 target，由调用方按需补充）。
+    """
     results: list[dict] = []
-    # hop_int -> [规范化 next_hop, 命中目标数]；同一 ECMP 结果的去重下一跳
-    # 只出现一次，但对每个命中目标各计一次
-    hop_stats: dict[int, list] = {}
-    unreachable_count = 0
-
-    for value, text in parsed_targets:
+    for value, _text in parsed_targets:
         best_prefix = -1
         best_metric: int = 1 << 30  # 哨兵：尚无命中时大于任何合法 metric
         chosen: list[dict] = []
@@ -178,10 +226,8 @@ def resolve_routes(
                     chosen.append(route)
 
         if not chosen:
-            unreachable_count += 1
             results.append(
                 {
-                    "target": text,
                     "status": UNREACHABLE,
                     "matched_cidr": None,
                     "metric": None,
@@ -190,33 +236,62 @@ def resolve_routes(
             )
             continue
 
-        # chosen 已按 routes 输入顺序排列；next_hop 去重并分别计数一次
+        # chosen 已按 routes 输入顺序排列；next_hop 去重
         next_hops: list[str] = []
         counted_hops: set[int] = set()
         for route in chosen:
-            hop_int = route["hop_int"]
-            if hop_int not in counted_hops:
-                counted_hops.add(hop_int)
+            if route["hop_int"] not in counted_hops:
+                counted_hops.add(route["hop_int"])
                 next_hops.append(route["next_hop"])
-                stat = hop_stats.get(hop_int)
-                if stat is None:
-                    stat = [route["next_hop"], 0]
-                    hop_stats[hop_int] = stat
-                stat[1] += 1
 
         results.append(
             {
-                "target": text,
                 "status": REACHABLE,
                 "matched_cidr": chosen[0]["cidr"],
                 "metric": chosen[0]["metric"],
                 "next_hops": next_hops,
             }
         )
+    return results
+
+
+def resolve_routes(
+    routes: Sequence[tuple[str, str, int]],
+    targets: Sequence[str],
+) -> dict:
+    """解析一组目标地址的最长前缀、最低 metric 等价下一跳。
+
+    ``routes`` 每项为 ``(cidr, next_hop, metric)``，允许为空（此时所有目标
+    均不可达）；``targets`` 每项为单个严格 IPv4 地址，**必须唯一**。
+
+    返回可直接 JSON 序列化的字典：``results`` 严格保持 targets 输入顺序；
+    命中项给出 ``status="reachable"``、共同命中的规范化 ``matched_cidr``、
+    ``metric`` 与按 routes 输入顺序去重的 ``next_hops``；未命中项为
+    ``status="unreachable"``、其余字段为 ``None`` / ``[]``。
+    ``summary.next_hop_counts`` 汇总每个 next_hop 命中的**目标数**（同一
+    ECMP 结果的各下一跳分别计一次），按 next_hop 在 routes 中的首次出现
+    位置排序。目标重复时抛出 :class:`DuplicateTargetsError`，非法 CIDR /
+    地址 / metric 抛出对应 ValueError 子类。
+    """
+    parsed_routes, hop_first_index = _parse_route_entries(routes)
+    parsed_targets = _parse_target_list(targets)
+    resolutions = _resolve_targets(parsed_routes, parsed_targets)
+
+    results: list[dict] = []
+    # 规范化 next_hop -> 命中目标数；同一 ECMP 结果的去重下一跳各计一次
+    hop_counts: dict[str, int] = {}
+    unreachable_count = 0
+    for (_value, text), resolution in zip(parsed_targets, resolutions):
+        if resolution["status"] == UNREACHABLE:
+            unreachable_count += 1
+        else:
+            for hop in resolution["next_hops"]:
+                hop_counts[hop] = hop_counts.get(hop, 0) + 1
+        results.append({"target": text, **resolution})
 
     next_hop_counts = [
-        {"next_hop": hop_stats[hop_int][0], "target_count": hop_stats[hop_int][1]}
-        for hop_int in sorted(hop_stats, key=lambda hop: hop_first_index[hop])
+        {"next_hop": hop, "target_count": hop_counts[hop]}
+        for hop in sorted(hop_counts, key=lambda hop: hop_first_index[hop])
     ]
 
     return {
@@ -228,4 +303,94 @@ def resolve_routes(
             "unreachable_count": unreachable_count,
             "next_hop_counts": next_hop_counts,
         },
+    }
+
+
+def _classify_impact(before: dict, after: dict) -> str:
+    """比较同一目标故障前后的解析结果并归类影响。
+
+    仅删除路由不可能产生新的可达性，因此 before 不可达时 after 必然
+    也不可达（归为 unchanged）。
+    """
+    if before["status"] == UNREACHABLE and after["status"] == UNREACHABLE:
+        return UNCHANGED
+    if after["status"] == UNREACHABLE:
+        return UNREACHABLE  # 原本可达，故障后不可达
+    if before["status"] == UNREACHABLE:
+        return REROUTED  # 防御性兜底：仅删除路由不会到达此分支
+    if (
+        before["matched_cidr"] == after["matched_cidr"]
+        and before["metric"] == after["metric"]
+    ):
+        if before["next_hops"] == after["next_hops"]:
+            return UNCHANGED
+        # 剩余路由是原路由的子集，同网段同 metric 下下一跳必然严格减少
+        return ECMP_REDUCED
+    return REROUTED
+
+
+def failover_routes(
+    routes: Sequence[tuple[str, str, int]],
+    targets: Sequence[str],
+    failed_next_hops: Sequence[str],
+) -> dict:
+    """模拟若干下一跳失效后的路由切换影响。
+
+    先在完整路由表上按 :func:`resolve_routes` 语义解析一次（before），
+    再移除 ``failed_next_hops`` 对应的**全部路由**，重新执行最长前缀、
+    最低 metric 与 ECMP 选择（after）——不是从原 ECMP 列表中删值，
+    因此允许回退到**更高 metric** 或**更短前缀**。
+
+    ``routes`` / ``targets`` 的校验与 :func:`resolve_routes` 完全一致；
+    ``failed_next_hops`` 每项为单个严格 IPv4 地址，**必须唯一**，允许为空
+    （此时所有目标均为 ``unchanged``）。
+
+    返回可直接 JSON 序列化的字典：``results`` 严格保持 targets 输入顺序，
+    每项含 ``target`` / ``before`` / ``after`` / ``impact``；``summary``
+    汇总四类 impact 的数量。impact 取值：
+
+    - ``unchanged``：解析结果完全不变（含两侧均不可达）；
+    - ``ecmp_reduced``：命中网段与 metric 不变，等价下一跳减少；
+    - ``rerouted``：仍可达但命中网段或 metric 改变（回退到更短前缀或
+      更高 metric）；
+    - ``unreachable``：原本可达、故障后不可达。
+
+    目标重复抛出 :class:`DuplicateTargetsError`，失败下一跳重复抛出
+    :class:`DuplicateNextHopsError`，非法 CIDR / 地址 / metric 抛出对应
+    ValueError 子类。
+    """
+    parsed_routes, _hop_first_index = _parse_route_entries(routes)
+    parsed_targets = _parse_target_list(targets)
+    parsed_failed = _parse_failed_next_hops(failed_next_hops)
+
+    failed_values = {value for value, _text in parsed_failed}
+    remaining_routes = [
+        route for route in parsed_routes if route["hop_int"] not in failed_values
+    ]
+
+    before_list = _resolve_targets(parsed_routes, parsed_targets)
+    after_list = _resolve_targets(remaining_routes, parsed_targets)
+
+    results: list[dict] = []
+    impact_counts = {impact: 0 for impact in IMPACTS}
+    for (_value, text), before, after in zip(
+        parsed_targets, before_list, after_list
+    ):
+        impact = _classify_impact(before, after)
+        impact_counts[impact] += 1
+        results.append(
+            {
+                "target": text,
+                "before": before,
+                "after": after,
+                "impact": impact,
+            }
+        )
+
+    return {
+        "route_count": len(parsed_routes),
+        "target_count": len(parsed_targets),
+        "failed_next_hops": [text for _value, text in parsed_failed],
+        "results": results,
+        "summary": impact_counts,
     }

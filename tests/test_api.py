@@ -736,3 +736,258 @@ def test_resolve_existing_endpoints_unchanged():
     assert post_hierarchy(
         [{"id": "a", "cidr": "10.0.0.0/8"}]
     ).status_code == 200
+
+
+# ---------- /routes/failover ----------
+
+def post_failover(routes, targets, failed_next_hops):
+    return client.post(
+        "/routes/failover",
+        json={
+            "routes": routes,
+            "targets": targets,
+            "failed_next_hops": failed_next_hops,
+        },
+    )
+
+
+def test_failover_all_four_impacts():
+    resp = post_failover(
+        [
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 10},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 10},
+            {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1", "metric": 5},
+            {"cidr": "11.0.0.0/8", "next_hop": "11.0.0.1", "metric": 7},
+            {"cidr": "12.0.0.0/8", "next_hop": "12.0.0.1", "metric": 3},
+        ],
+        ["10.0.9.9", "10.1.0.9", "11.0.0.9", "12.0.0.9"],
+        ["10.0.0.2", "10.1.0.1", "11.0.0.1"],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 5
+    assert body["target_count"] == 4
+    assert body["failed_next_hops"] == ["10.0.0.2", "10.1.0.1", "11.0.0.1"]
+
+    results = body["results"]
+    # 严格保持 targets 输入顺序
+    assert [r["target"] for r in results] == [
+        "10.0.9.9",
+        "10.1.0.9",
+        "11.0.0.9",
+        "12.0.0.9",
+    ]
+    assert [r["impact"] for r in results] == [
+        "ecmp_reduced",
+        "rerouted",
+        "unreachable",
+        "unchanged",
+    ]
+
+    # ecmp_reduced：命中网段与 metric 不变，等价下一跳减少
+    assert results[0]["before"] == {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["10.0.0.1", "10.0.0.2"],
+    }
+    assert results[0]["after"] == {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["10.0.0.1"],
+    }
+    # rerouted：/16 失效后回退到更短前缀 /8
+    assert results[1]["before"]["matched_cidr"] == "10.1.0.0/16"
+    assert results[1]["after"] == {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["10.0.0.1"],
+    }
+    # unreachable：唯一路由失效
+    assert results[2]["after"] == {
+        "status": "unreachable",
+        "matched_cidr": None,
+        "metric": None,
+        "next_hops": [],
+    }
+    # unchanged：before/after 完全一致
+    assert results[3]["before"] == results[3]["after"]
+
+    assert body["summary"] == {
+        "unchanged": 1,
+        "ecmp_reduced": 1,
+        "rerouted": 1,
+        "unreachable": 1,
+    }
+
+
+def test_failover_fallback_to_higher_metric_not_ecmp_shrink():
+    # 同网段最低 metric 路由全部失效：回退到更高 metric，而不是把 ECMP 删空
+    resp = post_failover(
+        [
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 10},
+            {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 50},
+        ],
+        ["10.0.0.9"],
+        ["10.0.0.1"],
+    )
+    assert resp.status_code == 200
+    item = resp.json()["results"][0]
+    assert item["impact"] == "rerouted"
+    assert item["before"]["metric"] == 10
+    assert item["after"] == {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 50,
+        "next_hops": ["10.0.0.2"],
+    }
+
+
+def test_failover_empty_failed_next_hops_all_unchanged():
+    resp = post_failover(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8", "9.9.9.9"],
+        [],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["failed_next_hops"] == []
+    assert [r["impact"] for r in body["results"]] == ["unchanged", "unchanged"]
+    assert body["summary"] == {
+        "unchanged": 2,
+        "ecmp_reduced": 0,
+        "rerouted": 0,
+        "unreachable": 0,
+    }
+
+
+def test_failover_failed_next_hops_normalized():
+    resp = post_failover(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8"],
+        [" 1.1.1.1 "],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["failed_next_hops"] == ["1.1.1.1"]
+    assert body["results"][0]["impact"] == "unreachable"
+
+
+def test_failover_duplicate_failed_next_hops_422_lists_indexes():
+    resp = post_failover(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8"],
+        ["1.1.1.1", "2.2.2.2", "1.1.1.1"],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "duplicate_next_hops",
+        "duplicates": [{"next_hop": "1.1.1.1", "indexes": [0, 2]}],
+    }
+
+
+def test_failover_duplicate_targets_422():
+    resp = post_failover(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8", "9.9.9.9", "8.8.8.8"],
+        ["1.1.1.1"],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == {
+        "error": "duplicate_targets",
+        "duplicates": [{"target": "8.8.8.8", "indexes": [0, 2]}],
+    }
+
+
+def test_failover_validation_422():
+    valid_route = {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 10}
+
+    # 缺少字段 / 请求体为空
+    assert client.post("/routes/failover", json={}).status_code == 422
+    assert client.post(
+        "/routes/failover", json={"routes": [], "targets": ["8.8.8.8"]}
+    ).status_code == 422
+    assert client.post(
+        "/routes/failover",
+        json={"routes": [], "failed_next_hops": ["1.1.1.1"]},
+    ).status_code == 422
+    assert client.post(
+        "/routes/failover",
+        json={"targets": ["8.8.8.8"], "failed_next_hops": []},
+    ).status_code == 422
+
+    # 非法 failed_next_hops：CIDR 写法 / IPv6 / 越界 / 前导零 / 空串 / 非字符串
+    for bad in ["10.0.0.1/32", "::1", "999.0.0.1", "010.0.0.1", "", 8, True, None]:
+        resp = post_failover([valid_route], ["10.0.0.9"], [bad])
+        assert resp.status_code == 422, bad
+
+    # 非法 route cidr / next_hop / metric / target：沿用 /routes/resolve 校验
+    for bad in ["10.0.0.1/8", "10.0.0.0/33", "2001:db8::/32", "garbage"]:
+        route = {"cidr": bad, "next_hop": "10.0.0.1", "metric": 10}
+        assert post_failover([route], ["10.0.0.9"], []).status_code == 422, bad
+    for bad in ["10.0.0.1/32", "::1", "999.0.0.1"]:
+        route = {"cidr": "10.0.0.0/8", "next_hop": bad, "metric": 10}
+        assert post_failover([route], ["10.0.0.9"], []).status_code == 422, bad
+    for bad_metric in [-1, 65536, True, 1.5, "10"]:
+        route = {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": bad_metric}
+        assert post_failover([route], ["10.0.0.9"], []).status_code == 422, bad_metric
+    for bad in ["8.8.8.8/32", "2001:db8::1", "010.0.0.1", 8, True, None]:
+        assert post_failover([valid_route], [bad], []).status_code == 422, bad
+
+    # 数量限制：路由 > 1000、目标 > 500、目标为空、失败下一跳 > 1000
+    too_many_routes = [
+        {"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}
+        for _ in range(1001)
+    ]
+    assert post_failover(too_many_routes, ["8.8.8.8"], []).status_code == 422
+    too_many_targets = [f"8.8.{i // 256}.{i % 256}" for i in range(501)]
+    assert post_failover([valid_route], too_many_targets, []).status_code == 422
+    assert post_failover([valid_route], [], []).status_code == 422
+    too_many_failed = [f"192.0.{i // 256}.{i % 256}" for i in range(1001)]
+    assert post_failover([valid_route], ["10.0.0.9"], too_many_failed).status_code == 422
+
+    # 字段类型错误
+    assert client.post(
+        "/routes/failover",
+        json={"routes": "x", "targets": ["8.8.8.8"], "failed_next_hops": []},
+    ).status_code == 422
+    assert client.post(
+        "/routes/failover",
+        json={"routes": [], "targets": ["8.8.8.8"], "failed_next_hops": "x"},
+    ).status_code == 422
+
+
+def test_failover_limits_accepted():
+    routes = [
+        {"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}
+        for _ in range(1000)
+    ]
+    targets = [f"8.8.{i // 256}.{i % 256}" for i in range(500)]
+    failed = [f"192.0.{i // 256}.{i % 256}" for i in range(1000)]
+    resp = post_failover(routes, targets, failed)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_count"] == 1000
+    assert body["target_count"] == 500
+    assert len(body["failed_next_hops"]) == 1000
+    # 失败下一跳均不在路由表中：全部 unchanged
+    assert body["summary"] == {
+        "unchanged": 500,
+        "ecmp_reduced": 0,
+        "rerouted": 0,
+        "unreachable": 0,
+    }
+
+
+def test_failover_existing_endpoints_unchanged():
+    # 新接口不影响既有接口
+    assert client.get("/health").status_code == 200
+    resp = post_resolve(
+        [{"cidr": "0.0.0.0/0", "next_hop": "1.1.1.1", "metric": 0}],
+        ["8.8.8.8"],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["results"][0]["next_hops"] == ["1.1.1.1"]
+    assert post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}]).status_code == 200

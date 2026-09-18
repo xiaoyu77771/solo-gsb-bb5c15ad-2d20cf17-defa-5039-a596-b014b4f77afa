@@ -6,12 +6,15 @@ from ipaddress import ip_network
 
 from app.analyzer import parse_cidr_v4
 from app.router import (
+    FAILED_NEXT_HOPS_MAX,
     METRIC_MAX,
     ROUTES_MAX,
     TARGETS_MAX,
+    DuplicateNextHopsError,
     DuplicateTargetsError,
     InvalidIPv4AddressError,
     InvalidMetricError,
+    failover_routes,
     normalize_metric,
     parse_address_v4,
     resolve_routes,
@@ -413,3 +416,357 @@ def test_resolve_random_oracle():
         reachable = sum(1 for r in result["results"] if r["status"] == "reachable")
         assert result["summary"]["reachable_count"] == reachable
         assert result["summary"]["unreachable_count"] == len(uniq) - reachable
+
+
+# ---------- 故障切换（failover） ----------
+
+def test_failover_unchanged_when_failed_hop_unrelated():
+    # 失败下一跳不在路由表中：结果完全不变
+    result = failover_routes(
+        [("10.0.0.0/8", "10.0.0.1", 10)],
+        ["10.0.0.9"],
+        ["192.0.2.1"],
+    )
+    item = result["results"][0]
+    assert item["impact"] == "unchanged"
+    assert item["before"] == item["after"]
+    assert result["summary"] == {
+        "unchanged": 1,
+        "ecmp_reduced": 0,
+        "rerouted": 0,
+        "unreachable": 0,
+    }
+
+
+def test_failover_ecmp_reduced():
+    # 移除 ECMP 中一个下一跳：命中网段与 metric 不变，等价下一跳减少
+    result = failover_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 20),
+            ("10.0.0.0/8", "10.0.0.2", 20),
+            ("10.0.0.0/8", "10.0.0.3", 20),
+        ],
+        ["10.0.0.9"],
+        ["10.0.0.2"],
+    )
+    item = result["results"][0]
+    assert item["impact"] == "ecmp_reduced"
+    assert item["before"] == {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 20,
+        "next_hops": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+    }
+    assert item["after"] == {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 20,
+        "next_hops": ["10.0.0.1", "10.0.0.3"],
+    }
+    assert result["summary"]["ecmp_reduced"] == 1
+
+
+def test_failover_rerouted_to_higher_metric_same_prefix():
+    # 最低 metric 路由全部失效：回退到同网段更高 metric，而非从 ECMP 删值
+    result = failover_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 10),
+            ("10.0.0.0/8", "10.0.0.2", 50),
+        ],
+        ["10.0.0.9"],
+        ["10.0.0.1"],
+    )
+    item = result["results"][0]
+    assert item["impact"] == "rerouted"
+    assert item["before"]["metric"] == 10
+    assert item["after"] == {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 50,
+        "next_hops": ["10.0.0.2"],
+    }
+
+
+def test_failover_rerouted_to_shorter_prefix():
+    # 长前缀路由全部失效：LPM 重新选择，回退到更短前缀
+    result = failover_routes(
+        [
+            ("0.0.0.0/0", "192.0.2.254", 100),
+            ("10.0.0.0/8", "10.0.0.1", 10),
+            ("10.1.0.0/16", "10.1.0.1", 5),
+        ],
+        ["10.1.0.9"],
+        ["10.1.0.1"],
+    )
+    item = result["results"][0]
+    assert item["impact"] == "rerouted"
+    assert item["before"]["matched_cidr"] == "10.1.0.0/16"
+    assert item["after"] == {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["10.0.0.1"],
+    }
+
+
+def test_failover_unreachable_and_both_unreachable_unchanged():
+    result = failover_routes(
+        [("10.0.0.0/8", "10.0.0.1", 10)],
+        ["10.0.0.9", "8.8.8.8"],
+        ["10.0.0.1"],
+    )
+    first, second = result["results"]
+    # 原本可达、故障后不可达
+    assert first["impact"] == "unreachable"
+    assert first["before"]["status"] == "reachable"
+    assert first["after"] == {
+        "status": "unreachable",
+        "matched_cidr": None,
+        "metric": None,
+        "next_hops": [],
+    }
+    # 两侧均不可达视为 unchanged
+    assert second["impact"] == "unchanged"
+    assert second["before"] == second["after"]
+    assert result["summary"] == {
+        "unchanged": 1,
+        "ecmp_reduced": 0,
+        "rerouted": 0,
+        "unreachable": 1,
+    }
+
+
+def test_failover_failed_hop_removes_all_its_routes():
+    # 同一失败下一跳出现在多条路由（不同前缀）中：全部移除
+    result = failover_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 10),
+            ("10.1.0.0/16", "10.0.0.1", 5),  # 同一下一跳，更长前缀
+            ("10.1.0.0/16", "10.1.0.2", 5),
+        ],
+        ["10.1.0.9"],
+        ["10.0.0.1"],
+    )
+    item = result["results"][0]
+    assert item["before"]["matched_cidr"] == "10.1.0.0/16"
+    assert item["before"]["next_hops"] == ["10.0.0.1", "10.1.0.2"]
+    # /16 中下一跳为 10.0.0.1 的路由也被移除，只剩 10.1.0.2
+    assert item["impact"] == "ecmp_reduced"
+    assert item["after"]["next_hops"] == ["10.1.0.2"]
+
+
+def test_failover_all_four_impacts_in_one_request():
+    result = failover_routes(
+        [
+            ("10.0.0.0/8", "10.0.0.1", 10),
+            ("10.0.0.0/8", "10.0.0.2", 10),
+            ("10.1.0.0/16", "10.1.0.1", 5),
+            ("11.0.0.0/8", "11.0.0.1", 7),
+            ("12.0.0.0/8", "12.0.0.1", 3),
+        ],
+        ["10.0.9.9", "10.1.0.9", "11.0.0.9", "12.0.0.9"],
+        ["10.0.0.2", "10.1.0.1", "11.0.0.1"],
+    )
+    assert [r["target"] for r in result["results"]] == [
+        "10.0.9.9",
+        "10.1.0.9",
+        "11.0.0.9",
+        "12.0.0.9",
+    ]
+    assert [r["impact"] for r in result["results"]] == [
+        "ecmp_reduced",  # /8 少了一个等价下一跳
+        "rerouted",      # /16 失效，回退到 /8
+        "unreachable",   # 唯一路由失效
+        "unchanged",     # 不受影响
+    ]
+    assert result["summary"] == {
+        "unchanged": 1,
+        "ecmp_reduced": 1,
+        "rerouted": 1,
+        "unreachable": 1,
+    }
+
+
+def test_failover_empty_failed_list_all_unchanged():
+    result = failover_routes(
+        [("0.0.0.0/0", "1.1.1.1", 0)],
+        ["8.8.8.8", "9.9.9.9"],
+        [],
+    )
+    assert result["failed_next_hops"] == []
+    assert [r["impact"] for r in result["results"]] == ["unchanged", "unchanged"]
+    assert result["summary"] == {
+        "unchanged": 2,
+        "ecmp_reduced": 0,
+        "rerouted": 0,
+        "unreachable": 0,
+    }
+
+
+def test_failover_failed_next_hops_normalized_and_order_preserved():
+    result = failover_routes(
+        [("0.0.0.0/0", "1.1.1.1", 0)],
+        ["8.8.8.8"],
+        [" 2.2.2.2 ", "1.1.1.1"],
+    )
+    assert result["failed_next_hops"] == ["2.2.2.2", "1.1.1.1"]
+    assert result["results"][0]["impact"] == "unreachable"
+
+
+def test_failover_duplicate_failed_next_hops_raises_with_indexes():
+    with pytest.raises(DuplicateNextHopsError) as exc:
+        failover_routes(
+            [("0.0.0.0/0", "1.1.1.1", 0)],
+            ["8.8.8.8"],
+            ["1.1.1.1", "2.2.2.2", "1.1.1.1", "2.2.2.2"],
+        )
+    assert exc.value.duplicates == [
+        {"next_hop": "1.1.1.1", "indexes": [0, 2]},
+        {"next_hop": "2.2.2.2", "indexes": [1, 3]},
+    ]
+
+
+def test_failover_duplicate_targets_still_raises():
+    with pytest.raises(DuplicateTargetsError):
+        failover_routes(
+            [("0.0.0.0/0", "1.1.1.1", 0)],
+            ["8.8.8.8", "8.8.8.8"],
+            ["1.1.1.1"],
+        )
+
+
+def test_failover_invalid_inputs_raise():
+    valid_route = ("10.0.0.0/8", "10.0.0.1", 10)
+    # 非法 failed_next_hops：CIDR 写法 / IPv6 / 越界 / 前导零 / 非字符串
+    for bad in ["10.0.0.1/32", "::1", "999.0.0.1", "010.0.0.1", 8, True, None, ""]:
+        with pytest.raises(InvalidIPv4AddressError):
+            failover_routes([valid_route], ["10.0.0.9"], [bad])
+    # 非法路由 / 目标沿用 resolve 校验
+    with pytest.raises(InvalidIPv4AddressError):
+        failover_routes([("10.0.0.0/8", "::1", 0)], ["10.0.0.9"], ["1.1.1.1"])
+    with pytest.raises(InvalidMetricError):
+        failover_routes([("10.0.0.0/8", "1.1.1.1", 65536)], ["10.0.0.9"], [])
+    with pytest.raises(InvalidIPv4AddressError):
+        failover_routes([valid_route], ["2001:db8::1"], ["1.1.1.1"])
+
+
+def test_failover_size_limits():
+    valid_route = ("10.0.0.0/8", "10.0.0.1", 10)
+    # 失败下一跳数量上限
+    with pytest.raises(ValueError):
+        failover_routes(
+            [valid_route],
+            ["10.0.0.9"],
+            [f"192.0.{i // 256}.{i % 256}" for i in range(FAILED_NEXT_HOPS_MAX + 1)],
+        )
+    # 路由 / 目标规模沿用 resolve 限制（空路由表合法：所有目标不可达）
+    result = failover_routes([], ["10.0.0.9"], [])
+    assert result["results"][0]["impact"] == "unchanged"
+    assert result["results"][0]["before"]["status"] == "unreachable"
+    with pytest.raises(ValueError):
+        failover_routes([], [], [])
+    many_routes = [
+        ("10.0.0.0/8", f"10.0.{i // 256}.{(i % 256) + 1}", i % (METRIC_MAX + 1))
+        for i in range(ROUTES_MAX + 1)
+    ]
+    with pytest.raises(ValueError):
+        failover_routes(many_routes, ["10.0.0.9"], [])
+    with pytest.raises(ValueError):
+        failover_routes(
+            [valid_route],
+            [f"8.8.{i // 256}.{i % 256}" for i in range(TARGETS_MAX + 1)],
+            [],
+        )
+
+
+def test_failover_max_limits_accepted():
+    routes = [("0.0.0.0/0", "1.1.1.1", 0) for _ in range(ROUTES_MAX)]
+    targets = [f"8.8.{i // 256}.{i % 256}" for i in range(TARGETS_MAX)]
+    failed = [f"192.0.{i // 256}.{i % 256}" for i in range(FAILED_NEXT_HOPS_MAX)]
+    result = failover_routes(routes, targets, failed)
+    assert result["route_count"] == ROUTES_MAX
+    assert result["target_count"] == TARGETS_MAX
+    assert len(result["failed_next_hops"]) == FAILED_NEXT_HOPS_MAX
+    # 失败下一跳均不在路由表中：全部 unchanged
+    assert result["summary"]["unchanged"] == TARGETS_MAX
+
+
+# ---------- 属性测试：failover 与“过滤后重新 resolve”oracle 对比 ----------
+
+def _oracle_impact(before, after):
+    """独立实现的 impact 归类，用于交叉验证。"""
+    if before["status"] == "unreachable" and after["status"] == "unreachable":
+        return "unchanged"
+    if after["status"] == "unreachable":
+        return "unreachable"
+    if before["status"] == "unreachable":
+        return "rerouted"
+    same_path = (
+        before["matched_cidr"] == after["matched_cidr"]
+        and before["metric"] == after["metric"]
+    )
+    if same_path:
+        return "unchanged" if before["next_hops"] == after["next_hops"] else "ecmp_reduced"
+    return "rerouted"
+
+
+def test_failover_random_oracle():
+    rng = random.Random(20260918)
+    base = ip_network("10.0.0.0/16")
+    candidate_nets = ["0.0.0.0/0", "10.0.0.0/8"]
+    for prefixlen in (17, 20, 24, 28, 30, 32):
+        candidate_nets.extend(str(n) for n in base.subnets(new_prefix=prefixlen))
+    hops_pool = [f"192.0.2.{i}" for i in range(1, 9)]
+
+    for _ in range(200):
+        n_routes = rng.randint(0, 20)
+        raw_routes = [
+            (rng.choice(candidate_nets), rng.choice(hops_pool), rng.randint(0, 5))
+            for _ in range(n_routes)
+        ]
+        targets = list(
+            dict.fromkeys(
+                f"10.0.{rng.randint(0, 255)}.{rng.randint(0, 255)}"
+                for _ in range(rng.randint(1, 6))
+            )
+        )
+        # 失败下一跳：部分来自路由表、部分为无关地址；允许为空
+        failed = list(
+            dict.fromkeys(
+                rng.choice(hops_pool + ["203.0.113.1", "203.0.113.2"])
+                for _ in range(rng.randint(0, 4))
+            )
+        )
+
+        result = failover_routes(raw_routes, targets, failed)
+
+        # oracle：before = 完整 resolve；after = 过滤失败下一跳全部路由后重新 resolve
+        failed_set = set(failed)
+        oracle_before = resolve_routes(raw_routes, targets)
+        oracle_after = resolve_routes(
+            [r for r in raw_routes if r[1] not in failed_set], targets
+        )
+
+        assert [r["target"] for r in result["results"]] == targets
+        assert result["failed_next_hops"] == failed
+        expected_counts = {"unchanged": 0, "ecmp_reduced": 0,
+                           "rerouted": 0, "unreachable": 0}
+        for item, before_item, after_item in zip(
+            result["results"], oracle_before["results"], oracle_after["results"]
+        ):
+            expected_before = {k: before_item[k] for k in (
+                "status", "matched_cidr", "metric", "next_hops")}
+            expected_after = {k: after_item[k] for k in (
+                "status", "matched_cidr", "metric", "next_hops")}
+            assert item["before"] == expected_before
+            assert item["after"] == expected_after
+            # ecmp_reduced 的下一跳必然是原 ECMP 的严格子集
+            if item["impact"] == "ecmp_reduced":
+                assert set(item["after"]["next_hops"]) < set(
+                    item["before"]["next_hops"]
+                )
+            expected_impact = _oracle_impact(expected_before, expected_after)
+            assert item["impact"] == expected_impact
+            expected_counts[expected_impact] += 1
+
+        assert result["summary"] == expected_counts

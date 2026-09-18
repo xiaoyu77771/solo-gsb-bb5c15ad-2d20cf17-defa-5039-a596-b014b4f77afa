@@ -35,6 +35,13 @@
 等价下一跳（ECMP），按 `routes` 输入顺序去重返回；未命中任何路由的目标标记为
 `unreachable`，并汇总每个 `next_hop` 命中的目标数。
 
+`POST /routes/failover` 在 `/routes/resolve` 的基础上模拟**下一跳故障**：
+先在完整路由表上解析一次（`before`），再移除 `failed_next_hops` 对应的
+**全部路由**并重新执行最长前缀、最低 metric 与 ECMP 选择（`after`）——
+不是从原 ECMP 列表中删值，因此允许回退到**更高 metric** 或**更短前缀**。
+逐目标返回 `before` / `after` / `impact`（`unchanged` / `ecmp_reduced` /
+`rerouted` / `unreachable`），并汇总四类影响的目标数。
+
 > 遮蔽来源不区分动作：先前的 **allow 与 deny 规则取并集**，共同遮蔽后续规则。
 
 ---
@@ -53,6 +60,7 @@ docker compose up --build -d
 - **解释接口：** `POST http://localhost:8000/explain`
 - **层级接口：** `POST http://localhost:8000/cidrs/hierarchy`
 - **路由解析接口：** `POST http://localhost:8000/routes/resolve`
+- **故障切换接口：** `POST http://localhost:8000/routes/failover`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
 - **OpenAPI Schema：** http://localhost:8000/openapi.json
 - **健康检查：** http://localhost:8000/health
@@ -757,6 +765,200 @@ curl -s http://localhost:8000/routes/resolve \
   }'
 ```
 
+---
+
+### `POST /routes/failover`
+
+模拟一组下一跳失效后的路由切换影响。处理流程：
+
+1. 先在完整路由表上按 `/routes/resolve` 语义解析一次（`before`）；
+2. 移除 `failed_next_hops` 对应的**全部路由**（同一失败下一跳出现在多条
+   路由中时全部移除），**重新执行**最长前缀、最低 metric 与 ECMP 选择
+   （`after`）——**不是**从原 ECMP 列表中删值，因此允许回退到
+   **更高 metric** 或**更短前缀**；
+3. 逐目标比较前后结果并归类 `impact`，`summary` 汇总四类数量。
+
+- `routes` / `targets`：与 `/routes/resolve` 完全一致（路由 0～1000 条、
+  目标 1～500 个且唯一，校验规则相同）。
+- `failed_next_hops`：**0～1000 个**唯一失败下一跳 IPv4 地址（纯地址，
+  校验同 `next_hop`），允许为空 `[]`（此时所有目标均为 `unchanged`）；
+  重复时返回 **422** 并在 `detail.duplicates` 中列出冲突位置。
+- `results` **严格保持 targets 输入顺序**。
+
+`impact` 分类：
+
+| 值 | 含义 |
+| --- | --- |
+| `unchanged` | 解析结果完全不变（含两侧均不可达） |
+| `ecmp_reduced` | 命中网段与 metric 不变，等价下一跳减少（after 是 before 的严格子集） |
+| `rerouted` | 仍可达但命中网段或 metric 改变（回退到更短前缀或更高 metric） |
+| `unreachable` | 原本可达、故障后不可达 |
+
+#### 请求体
+
+```json
+{
+  "routes": [
+    {"cidr": "0.0.0.0/0",   "next_hop": "192.0.2.254", "metric": 100},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.1",    "metric": 10},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.2",    "metric": 10},
+    {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1",    "metric": 5},
+    {"cidr": "11.0.0.0/8",  "next_hop": "11.0.0.1",    "metric": 7}
+  ],
+  "targets": ["10.0.9.9", "10.1.0.9", "11.0.0.9", "8.8.8.8"],
+  "failed_next_hops": ["10.0.0.2", "10.1.0.1", "11.0.0.1"]
+}
+```
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `route_count` / `target_count` | 请求中的路由条数 / 目标数 |
+| `failed_next_hops` | 规范化后的失败下一跳列表，保持输入顺序 |
+| `results[]` | 逐目标故障切换结果，**严格保持 targets 输入顺序** |
+| `results[].target` | 规范化后的目标 IPv4 地址 |
+| `results[].before` / `.after` | 故障前 / 后的解析结果，结构同 `/routes/resolve` 的单目标结果（`status` / `matched_cidr` / `metric` / `next_hops`） |
+| `results[].impact` | 影响分类：`unchanged` / `ecmp_reduced` / `rerouted` / `unreachable` |
+| `summary.unchanged` / `.ecmp_reduced` / `.rerouted` / `.unreachable` | 四类影响各自的目标数（总和 = `target_count`） |
+
+#### 响应示例（200）
+
+上例中：`10.0.9.9` 的 ECMP 少了一个下一跳（`ecmp_reduced`）；`10.1.0.9`
+的 `/16` 路由失效，回退到更短前缀 `/8`（`rerouted`）；`11.0.0.9` 的唯一
+路由失效，回退到默认路由 `0.0.0.0/0`（`rerouted`）；`8.8.8.8` 不受影响
+（`unchanged`）：
+
+```json
+{
+  "route_count": 5,
+  "target_count": 4,
+  "failed_next_hops": ["10.0.0.2", "10.1.0.1", "11.0.0.1"],
+  "results": [
+    {
+      "target": "10.0.9.9",
+      "before": {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["10.0.0.1", "10.0.0.2"]
+      },
+      "after": {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["10.0.0.1"]
+      },
+      "impact": "ecmp_reduced"
+    },
+    {
+      "target": "10.1.0.9",
+      "before": {
+        "status": "reachable",
+        "matched_cidr": "10.1.0.0/16",
+        "metric": 5,
+        "next_hops": ["10.1.0.1"]
+      },
+      "after": {
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["10.0.0.1"]
+      },
+      "impact": "rerouted"
+    },
+    {
+      "target": "11.0.0.9",
+      "before": {
+        "status": "reachable",
+        "matched_cidr": "11.0.0.0/8",
+        "metric": 7,
+        "next_hops": ["11.0.0.1"]
+      },
+      "after": {
+        "status": "reachable",
+        "matched_cidr": "0.0.0.0/0",
+        "metric": 100,
+        "next_hops": ["192.0.2.254"]
+      },
+      "impact": "rerouted"
+    },
+    {
+      "target": "8.8.8.8",
+      "before": {
+        "status": "reachable",
+        "matched_cidr": "0.0.0.0/0",
+        "metric": 100,
+        "next_hops": ["192.0.2.254"]
+      },
+      "after": {
+        "status": "reachable",
+        "matched_cidr": "0.0.0.0/0",
+        "metric": 100,
+        "next_hops": ["192.0.2.254"]
+      },
+      "impact": "unchanged"
+    }
+  ],
+  "summary": {
+    "unchanged": 1,
+    "ecmp_reduced": 1,
+    "rerouted": 2,
+    "unreachable": 0
+  }
+}
+```
+
+若失败下一跳是某目标的唯一可达路径，`after` 为不可达：
+
+```json
+{
+  "target": "11.0.0.9",
+  "before": {
+    "status": "reachable",
+    "matched_cidr": "11.0.0.0/8",
+    "metric": 7,
+    "next_hops": ["11.0.0.1"]
+  },
+  "after": {
+    "status": "unreachable",
+    "matched_cidr": null,
+    "metric": null,
+    "next_hops": []
+  },
+  "impact": "unreachable"
+}
+```
+
+#### 错误示例（422，失败下一跳重复）
+
+```json
+{
+  "detail": {
+    "error": "duplicate_next_hops",
+    "duplicates": [
+      {"next_hop": "1.1.1.1", "indexes": [0, 2]}
+    ]
+  }
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/routes/failover \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "routes": [
+      {"cidr": "0.0.0.0/0", "next_hop": "192.0.2.254", "metric": 100},
+      {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 20},
+      {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 20}
+    ],
+    "targets": ["10.0.0.9", "8.8.8.8"],
+    "failed_next_hops": ["10.0.0.1"]
+  }'
+```
+
 ### 错误响应（422 Unprocessable Entity）
 
 以下输入均返回 HTTP `422`，错误明细位于 `detail`：
@@ -772,6 +974,9 @@ curl -s http://localhost:8000/routes/resolve \
   1～500、**目标地址重复**（在 `detail.duplicates` 中列出规范化目标及全部
   出现位置 `indexes`）、`next_hop` / `targets` 不是严格 IPv4 地址
   （CIDR 写法、前导零、IPv6 等）、`metric` 不在 0～65535 或不是整数
+- `/routes/failover` 除沿用 `/routes/resolve` 的全部校验外，还要求
+  `failed_next_hops` 为 0～1000 个**唯一**的严格 IPv4 地址，重复时在
+  `detail.duplicates` 中列出规范化下一跳及全部出现位置 `indexes`
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
 - IPv6 地址或网段：`2001:db8::/32`、`::1` 等
 - 非法 / 缺失 `action` 或 `default_action`、字段类型错误、JSON 格式错误
@@ -800,8 +1005,12 @@ pytest -q
 独占集合（仅扣直接子节点）、重复 id / 重复网段 422 与 1～500 数量边界，
 `/routes/resolve` 的最长前缀优先于 metric、同前缀最低 metric 选择、ECMP
 下一跳按输入顺序去重、未命中标记、逐下一跳命中汇总、重复目标 422 与
-数量/metric 边界，以及用标准库 `ipaddress.collapse_addresses` 作为 oracle
-的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比）。
+数量/metric 边界，`/routes/failover` 的四类影响归类（unchanged /
+ecmp_reduced / rerouted / unreachable）、回退到更高 metric 与更短前缀、
+失败下一跳整体移除其全部路由、重复失败下一跳 422 与数量边界，
+以及用标准库 `ipaddress.collapse_addresses` 作为 oracle
+的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比；
+failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证）。
 
 ---
 
@@ -812,8 +1021,8 @@ pytest -q
 ├── app/
 │   ├── __init__.py
 │   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因与包含层级
-│   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/routes/resolve 接口
+│   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析与下一跳故障切换
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/routes/resolve、/routes/failover 接口
 ├── tests/
 │   ├── test_analyzer.py
 │   ├── test_router.py
@@ -853,5 +1062,11 @@ pytest -q
   顺序去重得到 ECMP 列表。命中计数只随目标遍历累加（同一 ECMP 结果的
   每个下一跳各计一次），汇总按 next_hop 首次出现的路由序号排序。
   复杂度为 O(路由数 × 目标数) 的整数比较，**不逐地址展开网段**。
+- **故障切换**：`/routes/failover` 复用同一套解析流程跑两遍——完整路由表
+  得到 `before`，剔除失败下一跳对应的全部路由后重新解析得到 `after`
+  （因此可回退到更高 metric 或更短前缀，而非收缩原 ECMP 列表）；逐目标
+  比较归类 `impact`：两侧均不可达或结果一致为 `unchanged`，同网段同
+  metric 但下一跳减少为 `ecmp_reduced`，仍可达但网段或 metric 改变为
+  `rerouted`，原本可达而后不可达为 `unreachable`。
 - **整数运算**：全部基于 32 位无符号整数区间处理，避免字符串/对象开销，
   可正确支持 `0.0.0.0/0` 全空间等边界场景。
