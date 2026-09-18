@@ -35,6 +35,13 @@
 等价下一跳（ECMP），按 `routes` 输入顺序去重返回；未命中任何路由的目标标记为
 `unreachable`，并汇总每个 `next_hop` 命中的目标数。
 
+`POST /routes/failover` 在同一套解析规则上模拟**下一跳故障**：额外接收一组
+唯一的 `failed_next_hops`，先算出正常结果（before），再把这些下一跳对应的
+**全部路由整体移除**并**重新执行**最长前缀、最低 metric 与 ECMP 选择
+（after）——允许回退到较高 metric 的同前缀路由或更短前缀路由，而不是只从原
+ECMP 列表删值；按 targets 输入顺序逐目标给出 `before`、`after` 与影响分类
+（`unchanged` / `ecmp_reduced` / `rerouted` / `unreachable`）并汇总数量。
+
 > 遮蔽来源不区分动作：先前的 **allow 与 deny 规则取并集**，共同遮蔽后续规则。
 
 ---
@@ -53,6 +60,7 @@ docker compose up --build -d
 - **解释接口：** `POST http://localhost:8000/explain`
 - **层级接口：** `POST http://localhost:8000/cidrs/hierarchy`
 - **路由解析接口：** `POST http://localhost:8000/routes/resolve`
+- **故障切换接口：** `POST http://localhost:8000/routes/failover`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
 - **OpenAPI Schema：** http://localhost:8000/openapi.json
 - **健康检查：** http://localhost:8000/health
@@ -757,6 +765,227 @@ curl -s http://localhost:8000/routes/resolve \
   }'
 ```
 
+---
+
+### `POST /routes/failover`
+
+模拟**下一跳故障**的静态路由重解析。请求体沿用 `/routes/resolve` 的
+`routes` 与 `targets`（校验规则完全一致），额外增加一组唯一的
+`failed_next_hops`：
+
+1. 先按 /routes/resolve 的同一套规则算出每个目标的正常结果（**before**）；
+2. 把 next_hop 属于 `failed_next_hops` 的**全部路由从路由表中整体移除**；
+3. 在剩余路由上**重新执行**完整的最长前缀匹配、最低 metric 与 ECMP 选择，
+   得到故障后结果（**after**）。
+
+> 注意是**删路由后重跑选择**，不是只从原 ECMP 列表中删除故障下一跳：
+> 因此故障后允许回退到同前缀的**较高 metric** 路由、回退到**更短前缀**
+> （如 `/16` 不可用后改用 `/8` 甚至 `0.0.0.0/0`），也可能变得不可达。
+
+#### 影响分类（`impact`）
+
+逐目标对比 before/after，按 `targets` 输入顺序返回：
+
+| impact | 判定条件 |
+| --- | --- |
+| `unchanged` | 故障前后解析结果完全一致（目标本就不经过故障下一跳；原本不可达、故障后仍不可达也属此类） |
+| `ecmp_reduced` | 命中网段与 metric 均不变，仅 ECMP 下一跳集合变为原来的**严格非空真子集** |
+| `rerouted` | 改走其他路由：命中网段或 metric 发生变化（回退到较高 metric 同前缀路由，或回退到更短前缀） |
+| `unreachable` | 故障前可达，移除路由后没有任何路由可命中 |
+
+#### 请求体
+
+- `routes`：**0～1000 条**路由，字段与校验同 /routes/resolve。
+- `targets`：**1～500 个**唯一目标 IPv4 地址；重复返回 **422**。
+- `failed_next_hops`：**1～1000 个**唯一故障下一跳 IPv4 地址（纯地址，
+  校验同 `next_hop`）；**不要求**确实出现在 `routes` 中（全部未出现时所有
+  目标均为 `unchanged`）。重复时返回 **422** 并在
+  `detail.duplicates` 中列出冲突位置。
+
+```json
+{
+  "routes": [
+    {"cidr": "0.0.0.0/0",   "next_hop": "192.0.2.254", "metric": 100},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.1",    "metric": 20},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.2",    "metric": 20},
+    {"cidr": "10.0.0.0/8",  "next_hop": "10.0.0.9",    "metric": 80},
+    {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.1",    "metric": 60},
+    {"cidr": "10.1.0.0/16", "next_hop": "10.1.0.2",    "metric": 60},
+    {"cidr": "11.0.0.0/8",  "next_hop": "11.0.0.1",    "metric": 10}
+  ],
+  "targets": ["10.1.0.5", "10.2.2.2", "10.4.4.4", "8.8.8.8", "11.1.1.1"],
+  "failed_next_hops": ["10.1.0.2", "10.0.0.1", "10.0.0.2", "192.0.2.254"]
+}
+```
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `route_count` / `target_count` / `failed_next_hop_count` | 请求中的路由条数 / 目标数 / 故障下一跳数 |
+| `results[]` | 逐目标对比结果，**严格保持 targets 输入顺序** |
+| `results[].target` | 规范化后的目标 IPv4 地址 |
+| `results[].before` | 故障前解析结果，结构同 /routes/resolve 的单个 `results[]` 项 |
+| `results[].after` | 移除故障下一跳全部路由后重新解析的结果（不可达时 `matched_cidr`/`metric` 为 `null`、`next_hops` 为 `[]`） |
+| `results[].impact` | `unchanged` / `ecmp_reduced` / `rerouted` / `unreachable` |
+| `summary.unchanged_count` / `.ecmp_reduced_count` / `.rerouted_count` / `.unreachable_count` | 四类影响的目标数，四项之和等于 `target_count` |
+
+#### 响应示例（200）
+
+上例中：`10.1.0.5` 的 `/16` ECMP 少了一个下一跳（`ecmp_reduced`）；
+`10.2.2.2` 与 `10.4.4.4` 所在 `/8` 的 metric 20 两个下一跳均被移除，
+**回退到同前缀较高 metric 80** 的 `10.0.0.9`（`rerouted`）；`8.8.8.8` 的
+默认路由唯一下一跳故障（`unreachable`）；`11.1.1.1` 不经过任何故障下一跳
+（`unchanged`）：
+
+```json
+{
+  "route_count": 7,
+  "target_count": 5,
+  "failed_next_hop_count": 4,
+  "results": [
+    {
+      "target": "10.1.0.5",
+      "before": {
+        "target": "10.1.0.5",
+        "status": "reachable",
+        "matched_cidr": "10.1.0.0/16",
+        "metric": 60,
+        "next_hops": ["10.1.0.1", "10.1.0.2"]
+      },
+      "after": {
+        "target": "10.1.0.5",
+        "status": "reachable",
+        "matched_cidr": "10.1.0.0/16",
+        "metric": 60,
+        "next_hops": ["10.1.0.1"]
+      },
+      "impact": "ecmp_reduced"
+    },
+    {
+      "target": "10.2.2.2",
+      "before": {
+        "target": "10.2.2.2",
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 20,
+        "next_hops": ["10.0.0.1", "10.0.0.2"]
+      },
+      "after": {
+        "target": "10.2.2.2",
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 80,
+        "next_hops": ["10.0.0.9"]
+      },
+      "impact": "rerouted"
+    },
+    {
+      "target": "10.4.4.4",
+      "before": {
+        "target": "10.4.4.4",
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 20,
+        "next_hops": ["10.0.0.1", "10.0.0.2"]
+      },
+      "after": {
+        "target": "10.4.4.4",
+        "status": "reachable",
+        "matched_cidr": "10.0.0.0/8",
+        "metric": 80,
+        "next_hops": ["10.0.0.9"]
+      },
+      "impact": "rerouted"
+    },
+    {
+      "target": "8.8.8.8",
+      "before": {
+        "target": "8.8.8.8",
+        "status": "reachable",
+        "matched_cidr": "0.0.0.0/0",
+        "metric": 100,
+        "next_hops": ["192.0.2.254"]
+      },
+      "after": {
+        "target": "8.8.8.8",
+        "status": "unreachable",
+        "matched_cidr": null,
+        "metric": null,
+        "next_hops": []
+      },
+      "impact": "unreachable"
+    },
+    {
+      "target": "11.1.1.1",
+      "before": {
+        "target": "11.1.1.1",
+        "status": "reachable",
+        "matched_cidr": "11.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["11.0.0.1"]
+      },
+      "after": {
+        "target": "11.1.1.1",
+        "status": "reachable",
+        "matched_cidr": "11.0.0.0/8",
+        "metric": 10,
+        "next_hops": ["11.0.0.1"]
+      },
+      "impact": "unchanged"
+    }
+  ],
+  "summary": {
+    "unchanged_count": 1,
+    "ecmp_reduced_count": 1,
+    "rerouted_count": 2,
+    "unreachable_count": 1
+  }
+}
+```
+
+更短前缀回退示例：当 `10.1.0.0/16` 的两个下一跳都在故障列表中时，
+`10.1.0.5` 不会变成不可达，而是重新做 LPM 回退到 `10.0.0.0/8`（此时
+metric 20 的两个下一跳均未故障，仍是 ECMP）：
+
+```json
+{
+  "target": "10.1.0.5",
+  "before": {"target": "10.1.0.5", "status": "reachable", "matched_cidr": "10.1.0.0/16", "metric": 60, "next_hops": ["10.1.0.1", "10.1.0.2"]},
+  "after":  {"target": "10.1.0.5", "status": "reachable", "matched_cidr": "10.0.0.0/8",  "metric": 20, "next_hops": ["10.0.0.1", "10.0.0.2"]},
+  "impact": "rerouted"
+}
+```
+
+#### 错误示例（422，故障下一跳重复）
+
+```json
+{
+  "detail": {
+    "error": "duplicate_failed_next_hops",
+    "duplicates": [
+      {"next_hop": "10.0.0.1", "indexes": [0, 2]}
+    ]
+  }
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/routes/failover \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "routes": [
+      {"cidr": "0.0.0.0/0", "next_hop": "192.0.2.254", "metric": 100},
+      {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.1", "metric": 20},
+      {"cidr": "10.0.0.0/8", "next_hop": "10.0.0.2", "metric": 20}
+    ],
+    "targets": ["10.0.0.9", "8.8.8.8"],
+    "failed_next_hops": ["10.0.0.1", "192.0.2.254"]
+  }'
+```
+
 ### 错误响应（422 Unprocessable Entity）
 
 以下输入均返回 HTTP `422`，错误明细位于 `detail`：
@@ -772,6 +1001,10 @@ curl -s http://localhost:8000/routes/resolve \
   1～500、**目标地址重复**（在 `detail.duplicates` 中列出规范化目标及全部
   出现位置 `indexes`）、`next_hop` / `targets` 不是严格 IPv4 地址
   （CIDR 写法、前导零、IPv6 等）、`metric` 不在 0～65535 或不是整数
+- `/routes/failover` 除沿用上述 routes / targets 的全部校验外，缺少
+  `failed_next_hops`、故障下一跳为空或超过 1000 个、**故障下一跳重复**
+  （`detail.error` 为 `duplicate_failed_next_hops`，在 `detail.duplicates`
+  中列出规范化地址及全部出现位置 `indexes`），或故障下一跳不是严格 IPv4 地址
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
 - IPv6 地址或网段：`2001:db8::/32`、`::1` 等
 - 非法 / 缺失 `action` 或 `default_action`、字段类型错误、JSON 格式错误
@@ -801,7 +1034,12 @@ pytest -q
 `/routes/resolve` 的最长前缀优先于 metric、同前缀最低 metric 选择、ECMP
 下一跳按输入顺序去重、未命中标记、逐下一跳命中汇总、重复目标 422 与
 数量/metric 边界，以及用标准库 `ipaddress.collapse_addresses` 作为 oracle
-的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比）。
+的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比）；
+`/routes/failover` 的四类影响分类（unchanged / ecmp_reduced / rerouted /
+unreachable）、故障下一跳全部路由整体移除后回退到较高 metric 同前缀路由或
+更短前缀、ECMP 收窄、变得不可达、故障下一跳不出现时全部 unchanged、重复
+故障下一跳 422 与数量/地址边界，以及与“先删路由再暴力 LPM”逐目标对比的
+随机属性测试。
 
 ---
 
@@ -812,8 +1050,8 @@ pytest -q
 ├── app/
 │   ├── __init__.py
 │   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因与包含层级
-│   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/routes/resolve 接口
+│   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析与下一跳故障切换（failover）
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/routes/resolve、/routes/failover 接口
 ├── tests/
 │   ├── test_analyzer.py
 │   ├── test_router.py
@@ -853,5 +1091,12 @@ pytest -q
   顺序去重得到 ECMP 列表。命中计数只随目标遍历累加（同一 ECMP 结果的
   每个下一跳各计一次），汇总按 next_hop 首次出现的路由序号排序。
   复杂度为 O(路由数 × 目标数) 的整数比较，**不逐地址展开网段**。
+- **故障切换**：`/routes/failover` 复用同一套“整数区间命中 → LPM →
+  最低 metric → 输入顺序去重”选择逻辑，对故障前的完整路由表与剔除故障
+  下一跳**全部路由**后的路由表各解析一次；不是从原 ECMP 列表删值，因此
+  第二次选择可以落到较高 metric 的同前缀路由或更短前缀路由。逐目标按
+  “结果完全一致 / 同网段同 metric 仅 ECMP 严格收窄 / 网段或 metric 改变 /
+  故障后不可达”归类为 unchanged、ecmp_reduced、rerouted、unreachable。
+  故障下一跳与目标同样走严格 IPv4 校验与唯一性检查。
 - **整数运算**：全部基于 32 位无符号整数区间处理，避免字符串/对象开销，
   可正确支持 `0.0.0.0/0` 全空间等边界场景。

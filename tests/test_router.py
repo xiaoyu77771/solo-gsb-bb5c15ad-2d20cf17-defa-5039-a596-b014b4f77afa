@@ -6,14 +6,17 @@ from ipaddress import ip_network
 
 from app.analyzer import parse_cidr_v4
 from app.router import (
+    FAILED_NEXT_HOPS_MAX,
     METRIC_MAX,
     ROUTES_MAX,
     TARGETS_MAX,
+    DuplicateFailedNextHopsError,
     DuplicateTargetsError,
     InvalidIPv4AddressError,
     InvalidMetricError,
     normalize_metric,
     parse_address_v4,
+    resolve_failover,
     resolve_routes,
 )
 
@@ -413,3 +416,332 @@ def test_resolve_random_oracle():
         reachable = sum(1 for r in result["results"] if r["status"] == "reachable")
         assert result["summary"]["reachable_count"] == reachable
         assert result["summary"]["unreachable_count"] == len(uniq) - reachable
+
+
+# ---------- 故障切换 resolve_failover ----------
+
+FAILOVER_ROUTES = [
+    ("0.0.0.0/0", "192.0.2.254", 100),
+    ("10.0.0.0/8", "10.0.0.1", 20),
+    ("10.0.0.0/8", "10.0.0.2", 20),
+    ("10.0.0.0/8", "10.0.0.9", 80),   # 同前缀较高 metric 备份
+    ("10.1.0.0/16", "10.1.0.1", 60),
+    ("10.1.0.0/16", "10.1.0.2", 60),
+]
+
+
+def test_failover_ecmp_reduced_same_cidr_and_metric():
+    # 仅移除 /16 的一个等价下一跳：网段、metric 不变，ECMP 严格减少
+    result = resolve_failover(
+        FAILOVER_ROUTES, ["10.1.0.5"], ["10.1.0.2"]
+    )
+    item = result["results"][0]
+    assert item["impact"] == "ecmp_reduced"
+    assert item["before"]["next_hops"] == ["10.1.0.1", "10.1.0.2"]
+    assert item["after"]["matched_cidr"] == "10.1.0.0/16"
+    assert item["after"]["metric"] == 60
+    assert item["after"]["next_hops"] == ["10.1.0.1"]
+    assert result["summary"] == {
+        "unchanged_count": 0,
+        "ecmp_reduced_count": 1,
+        "rerouted_count": 0,
+        "unreachable_count": 0,
+    }
+
+
+def test_failover_rerouted_to_higher_metric_same_prefix():
+    # /8 最低 metric 下一跳全部故障 -> 回退到同前缀较高 metric，而非不可达
+    result = resolve_failover(
+        FAILOVER_ROUTES, ["10.2.2.2"], ["10.0.0.1", "10.0.0.2"]
+    )
+    item = result["results"][0]
+    assert item["impact"] == "rerouted"
+    assert item["before"]["matched_cidr"] == "10.0.0.0/8"
+    assert item["before"]["metric"] == 20
+    assert item["after"]["matched_cidr"] == "10.0.0.0/8"
+    assert item["after"]["metric"] == 80
+    assert item["after"]["next_hops"] == ["10.0.0.9"]
+
+
+def test_failover_rerouted_to_shorter_prefix():
+    # /16 下一跳全部故障 -> 必须重新做 LPM，回退到更短的 /8，
+    # 而不是只从原 ECMP 列表删值后判定不可达
+    result = resolve_failover(
+        FAILOVER_ROUTES, ["10.1.0.5"], ["10.1.0.1", "10.1.0.2"]
+    )
+    item = result["results"][0]
+    assert item["impact"] == "rerouted"
+    assert item["before"]["matched_cidr"] == "10.1.0.0/16"
+    assert item["after"]["matched_cidr"] == "10.0.0.0/8"
+    assert item["after"]["metric"] == 20
+    assert item["after"]["next_hops"] == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_failover_rerouted_shorter_prefix_then_higher_metric():
+    # 同时移除 /16 与 /8 最低 metric 路由：回退到更短前缀且只能用较高 metric
+    result = resolve_failover(
+        FAILOVER_ROUTES,
+        ["10.1.0.5"],
+        ["10.1.0.1", "10.1.0.2", "10.0.0.1", "10.0.0.2"],
+    )
+    item = result["results"][0]
+    assert item["impact"] == "rerouted"
+    assert item["after"]["matched_cidr"] == "10.0.0.0/8"
+    assert item["after"]["metric"] == 80
+    assert item["after"]["next_hops"] == ["10.0.0.9"]
+
+
+def test_failover_becomes_unreachable():
+    # 唯一下一跳（默认路由）故障，且无更短前缀/备份 -> 不可达
+    result = resolve_failover(
+        [("0.0.0.0/0", "1.1.1.1", 0)], ["8.8.8.8"], ["1.1.1.1"]
+    )
+    item = result["results"][0]
+    assert item["impact"] == "unreachable"
+    assert item["before"]["status"] == "reachable"
+    assert item["after"] == {
+        "target": "8.8.8.8",
+        "status": "unreachable",
+        "matched_cidr": None,
+        "metric": None,
+        "next_hops": [],
+    }
+
+
+def test_failover_originally_unreachable_stays_unreachable_is_unchanged():
+    result = resolve_failover(
+        [("10.0.0.0/8", "10.0.0.1", 0)], ["8.8.8.8"], ["10.0.0.1"]
+    )
+    item = result["results"][0]
+    assert item["before"]["status"] == "unreachable"
+    assert item["after"]["status"] == "unreachable"
+    assert item["impact"] == "unchanged"
+    assert result["summary"]["unchanged_count"] == 1
+
+
+def test_failover_unchanged_when_failed_hop_unused():
+    result = resolve_failover(
+        FAILOVER_ROUTES,
+        ["10.1.0.5", "10.2.2.2", "8.8.8.8"],
+        ["9.9.9.9"],  # 不在任何路由中
+    )
+    for item in result["results"]:
+        assert item["impact"] == "unchanged"
+        assert item["before"] == item["after"]
+    assert result["summary"] == {
+        "unchanged_count": 3,
+        "ecmp_reduced_count": 0,
+        "rerouted_count": 0,
+        "unreachable_count": 0,
+    }
+
+
+def test_failover_target_order_preserved():
+    targets = ["10.1.0.5", "10.2.2.2", "8.8.8.8", "172.16.0.1"]
+    result = resolve_failover(
+        FAILOVER_ROUTES, targets, ["10.1.0.2", "10.0.0.1", "192.0.2.254"]
+    )
+    assert [r["target"] for r in result["results"]] == targets
+    assert [r["impact"] for r in result["results"]] == [
+        "ecmp_reduced",   # /16 ECMP 少一跳，仍 metric 60
+        "ecmp_reduced",   # /8 metric 20 组少一跳，剩 10.0.0.2
+        "unreachable",    # 默认路由唯一下一跳故障
+        "unreachable",
+    ]
+    assert result["summary"] == {
+        "unchanged_count": 0,
+        "ecmp_reduced_count": 2,
+        "rerouted_count": 0,
+        "unreachable_count": 2,
+    }
+
+
+def test_failover_mixed_impacts_summary_counts():
+    routes = [
+        ("10.0.0.0/8", "10.0.0.1", 10),
+        ("10.0.0.0/8", "10.0.0.2", 10),
+        ("10.0.0.0/8", "10.0.0.3", 30),
+        ("11.0.0.0/8", "11.0.0.1", 5),
+    ]
+    result = resolve_failover(
+        routes,
+        ["10.0.0.9", "11.0.0.9"],
+        ["10.0.0.1"],  # 目标 1 ECMP 减少；目标 2 不经过该下一跳
+    )
+    by_target = {r["target"]: r for r in result["results"]}
+    assert by_target["10.0.0.9"]["impact"] == "ecmp_reduced"
+    assert by_target["10.0.0.9"]["after"]["next_hops"] == ["10.0.0.2"]
+    assert by_target["11.0.0.9"]["impact"] == "unchanged"
+    counts = result["summary"]
+    assert counts["unchanged_count"] + counts["ecmp_reduced_count"] + \
+        counts["rerouted_count"] + counts["unreachable_count"] == 2
+
+
+def test_failover_removes_all_routes_of_failed_hop_including_backups():
+    # 故障下一跳同时出现在不同前缀/metric 的多条路由上，全部都要移除
+    routes = [
+        ("0.0.0.0/0", "1.1.1.1", 100),
+        ("10.0.0.0/8", "1.1.1.1", 10),
+        ("10.1.0.0/16", "1.1.1.1", 5),
+        ("10.1.0.0/16", "10.1.0.9", 5),
+    ]
+    result = resolve_failover(routes, ["10.1.0.5"], ["1.1.1.1"])
+    item = result["results"][0]
+    # 1.1.1.1 的 /16 与 /8 路由都被移除：/16 仍有 10.1.0.9
+    assert item["after"]["matched_cidr"] == "10.1.0.0/16"
+    assert item["after"]["next_hops"] == ["10.1.0.9"]
+    assert item["impact"] == "ecmp_reduced"
+    # 默认路由也被移除：外部地址变得不可达
+    result2 = resolve_failover(routes, ["8.8.8.8"], ["1.1.1.1"])
+    assert result2["results"][0]["impact"] == "unreachable"
+
+
+def test_failover_before_matches_resolve_routes():
+    targets = ["10.1.0.5", "10.2.2.2", "8.8.8.8"]
+    normal = resolve_routes(FAILOVER_ROUTES, targets)
+    failover = resolve_failover(FAILOVER_ROUTES, targets, ["9.9.9.9"])
+    for before, expected in zip(
+        (r["before"] for r in failover["results"]), normal["results"]
+    ):
+        assert before == expected
+    assert failover["route_count"] == len(FAILOVER_ROUTES)
+    assert failover["target_count"] == 3
+    assert failover["failed_next_hop_count"] == 1
+
+
+def test_failover_duplicate_targets_raises_with_indexes():
+    with pytest.raises(DuplicateTargetsError) as exc:
+        resolve_failover(
+            [("0.0.0.0/0", "1.1.1.1", 0)],
+            ["8.8.8.8", "8.8.8.8"],
+            ["9.9.9.9"],
+        )
+    assert exc.value.duplicates == [
+        {"target": "8.8.8.8", "indexes": [0, 1]}
+    ]
+
+
+def test_failover_duplicate_failed_next_hops_raises_with_indexes():
+    with pytest.raises(DuplicateFailedNextHopsError) as exc:
+        resolve_failover(
+            [("0.0.0.0/0", "1.1.1.1", 0)],
+            ["8.8.8.8"],
+            ["9.9.9.9", "8.8.8.8", "9.9.9.9"],
+        )
+    assert exc.value.duplicates == [
+        {"next_hop": "9.9.9.9", "indexes": [0, 2]}
+    ]
+
+
+def test_failover_invalid_addresses_raise():
+    for bad in ["1.1.1.1/32", "::1", "010.0.0.1", ""]:
+        with pytest.raises(InvalidIPv4AddressError):
+            resolve_failover(
+                [("0.0.0.0/0", "1.1.1.1", 0)], ["8.8.8.8"], [bad]
+            )
+    # routes / targets 校验沿用 resolve_routes
+    with pytest.raises(InvalidIPv4AddressError):
+        resolve_failover(
+            [("0.0.0.0/0", "::1", 0)], ["8.8.8.8"], ["9.9.9.9"]
+        )
+    with pytest.raises(InvalidIPv4AddressError):
+        resolve_failover(
+            [("0.0.0.0/0", "1.1.1.1", 0)], ["::1"], ["9.9.9.9"]
+        )
+
+
+def test_failover_size_limits():
+    # failed_next_hops 不能为空、不能超过上限
+    with pytest.raises(ValueError):
+        resolve_failover([("0.0.0.0/0", "1.1.1.1", 0)], ["8.8.8.8"], [])
+    too_many_hops = [
+        f"10.0.{i // 256}.{(i % 256) + 1}" for i in range(FAILED_NEXT_HOPS_MAX + 1)
+    ]
+    with pytest.raises(ValueError):
+        resolve_failover(
+            [("0.0.0.0/0", "1.1.1.1", 0)], ["8.8.8.8"], too_many_hops
+        )
+    # 目标规模限制与 resolve 一致（路由允许为空，另见 empty_routes 用例）
+    with pytest.raises(ValueError):
+        resolve_failover(
+            [("0.0.0.0/0", "1.1.1.1", 0)], [], ["9.9.9.9"]
+        )
+    too_many_routes = [
+        ("10.0.0.0/8", f"10.0.{i // 256}.{(i % 256) + 1}", i % (METRIC_MAX + 1))
+        for i in range(ROUTES_MAX + 1)
+    ]
+    with pytest.raises(ValueError):
+        resolve_failover(too_many_routes, ["8.8.8.8"], ["9.9.9.9"])
+
+
+def test_failover_empty_routes_unchanged_unreachable():
+    # 无路由：故障前后都不可达，分类 unchanged
+    result = resolve_failover([], ["8.8.8.8", "9.9.9.9"], ["1.1.1.1"])
+    assert [r["impact"] for r in result["results"]] == ["unchanged", "unchanged"]
+    assert all(r["after"]["status"] == "unreachable" for r in result["results"])
+    assert result["route_count"] == 0
+
+
+def _expected_impact(before, after):
+    """独立于实现的影响分类 oracle。"""
+    if before == after:
+        return "unchanged"
+    if after["status"] == "unreachable":
+        return "unreachable"
+    if (
+        before["status"] == "reachable"
+        and before["matched_cidr"] == after["matched_cidr"]
+        and before["metric"] == after["metric"]
+        and set(after["next_hops"]) < set(before["next_hops"])
+    ):
+        return "ecmp_reduced"
+    return "rerouted"
+
+
+def test_failover_random_oracle():
+    rng = random.Random(20260918)
+    base = ip_network("10.0.0.0/16")
+    candidate_nets = ["0.0.0.0/0", "10.0.0.0/8"]
+    for prefixlen in (17, 20, 24, 28, 30, 32):
+        candidate_nets.extend(str(n) for n in base.subnets(new_prefix=prefixlen))
+    hops_pool = [f"192.0.2.{i}" for i in range(1, 9)]
+
+    for _ in range(300):
+        n_routes = rng.randint(0, 20)
+        raw_routes = [
+            (rng.choice(candidate_nets), rng.choice(hops_pool), rng.randint(0, 5))
+            for _ in range(n_routes)
+        ]
+        targets = list(dict.fromkeys(
+            f"10.0.{rng.randint(0, 255)}.{rng.randint(0, 255)}"
+            for _ in range(rng.randint(1, 6))
+        ))
+        # 从路由实际使用的下一跳 + 池外地址中抽取故障集合（保证唯一）
+        used_hops = list(dict.fromkeys(h for _, h, _ in raw_routes))
+        pool = used_hops + ["198.51.100.1", "198.51.100.2"]
+        rng.shuffle(pool)
+        failed = list(dict.fromkeys(pool[: rng.randint(1, min(4, len(pool)))]))
+        if not failed:
+            continue
+
+        result = resolve_failover(raw_routes, targets, failed)
+        surviving = [r for r in raw_routes if r[1] not in set(failed)]
+        expected_after = resolve_routes(surviving, targets)
+        normal = resolve_routes(raw_routes, targets)
+
+        counts = {"unchanged": 0, "ecmp_reduced": 0, "rerouted": 0, "unreachable": 0}
+        for item, exp_before, exp_after_item in zip(
+            result["results"], normal["results"], expected_after["results"]
+        ):
+            assert item["target"] == exp_before["target"]
+            assert item["before"] == exp_before
+            assert item["after"] == exp_after_item
+            assert item["impact"] == _expected_impact(exp_before, exp_after_item)
+            counts[item["impact"]] += 1
+
+        assert result["summary"] == {
+            "unchanged_count": counts["unchanged"],
+            "ecmp_reduced_count": counts["ecmp_reduced"],
+            "rerouted_count": counts["rerouted"],
+            "unreachable_count": counts["unreachable"],
+        }

@@ -17,12 +17,15 @@ from .analyzer import (
     parse_cidr_v4,
 )
 from .router import (
+    FAILED_NEXT_HOPS_MAX,
     METRIC_MAX,
     ROUTES_MAX,
     TARGETS_MAX,
+    DuplicateFailedNextHopsError,
     DuplicateTargetsError,
     InvalidIPv4AddressError,
     parse_address_v4,
+    resolve_failover,
     resolve_routes,
 )
 
@@ -36,9 +39,11 @@ app = FastAPI(
         "通过 /explain 解释一段地址空间由哪条规则或默认动作最终裁决，"
         "通过 /cidrs/hierarchy 分析一组 CIDR 的包含层级（森林）与独占地址，"
         "或通过 /routes/resolve 对目标地址做最长前缀匹配、最低 metric 的"
-        "等价多路径（ECMP）路由解析。"
+        "等价多路径（ECMP）路由解析，或通过 /routes/failover 模拟下一跳"
+        "故障：移除故障下一跳的全部路由后重新执行 LPM/metric/ECMP 选择，"
+        "给出故障前后的 before/after 结果与逐目标影响分类。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -359,6 +364,74 @@ class RouteResolveResponse(BaseModel):
     summary: RouteResolveSummary
 
 
+# ---------- /routes/failover ----------
+
+
+class RouteFailoverRequest(RouteResolveRequest):
+    """故障切换请求：沿用 /routes/resolve 的 routes/targets，外加唯一的故障下一跳。"""
+
+    failed_next_hops: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=FAILED_NEXT_HOPS_MAX,
+        description=(
+            "故障下一跳 IPv4 地址列表（纯地址），全请求内唯一；"
+            "不要求确实出现在 routes 中"
+        ),
+    )
+
+    @field_validator("failed_next_hops", mode="before")
+    @classmethod
+    def validate_failed_next_hops(cls, value: object) -> object:
+        # 逐地址严格校验并规范化；非法地址 / CIDR 写法 / IPv6 -> 422
+        if isinstance(value, list):
+            return [parse_address_v4(item)[1] for item in value]
+        return value
+
+
+Impact = Literal["unchanged", "ecmp_reduced", "rerouted", "unreachable"]
+
+
+class FailoverTarget(BaseModel):
+    target: str = Field(..., description="规范化后的目标 IPv4 地址")
+    before: ResolvedTarget = Field(..., description="故障前（正常路由表）的解析结果")
+    after: ResolvedTarget = Field(
+        ...,
+        description=(
+            "移除全部故障下一跳对应路由后重新执行 LPM/最低 metric/ECMP 的解析结果"
+        ),
+    )
+    impact: Impact = Field(
+        ...,
+        description=(
+            "影响分类：unchanged 结果不变；ecmp_reduced 同网段同 metric 仅 ECMP "
+            "下一跳减少；rerouted 改走其他路由（较高 metric 或更短前缀）；"
+            "unreachable 故障后不可达"
+        ),
+    )
+
+
+class RouteFailoverSummary(BaseModel):
+    unchanged_count: int = Field(..., description="结果不受故障影响的目标数")
+    ecmp_reduced_count: int = Field(
+        ..., description="同网段同 metric、仅 ECMP 下一跳减少的目标数"
+    )
+    rerouted_count: int = Field(
+        ..., description="改走其他路由（较高 metric 或更短前缀）的目标数"
+    )
+    unreachable_count: int = Field(..., description="故障后变得不可达的目标数")
+
+
+class RouteFailoverResponse(BaseModel):
+    route_count: int = Field(..., description="请求中的路由条数")
+    target_count: int = Field(..., description="请求中的目标数")
+    failed_next_hop_count: int = Field(..., description="请求中的故障下一跳数")
+    results: list[FailoverTarget] = Field(
+        ..., description="逐目标故障前后对比，严格保持 targets 输入顺序"
+    )
+    summary: RouteFailoverSummary
+
+
 @app.get("/", tags=["meta"])
 def root() -> dict:
     """服务信息。"""
@@ -513,6 +586,61 @@ def routes_resolve(request: RouteResolveRequest) -> dict:
         raise HTTPException(
             status_code=422,
             detail={"error": "duplicate_targets", "duplicates": exc.duplicates},
+        ) from exc
+    except (InvalidCIDRError, InvalidIPv4AddressError):
+        # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
+        raise
+
+
+@app.post(
+    "/routes/failover",
+    response_model=RouteFailoverResponse,
+    tags=["routes"],
+    summary="模拟下一跳故障：移除故障下一跳全部路由后重新解析并对比影响",
+)
+def routes_failover(request: RouteFailoverRequest) -> dict:
+    """先按 /routes/resolve 的同一套规则算出每个目标的正常结果（before），
+    再把 next_hop 属于 `failed_next_hops` 的**全部路由整体移除**，在剩余
+    路由上**重新执行**最长前缀匹配、最低 metric 与 ECMP 选择得到 after。
+
+    - 不是只从原 ECMP 列表删除下一跳：故障下一跳的高/低 metric、长/短前缀
+      路由全部移除后重新选择，因此允许回退到**较高 metric** 的同前缀路由或
+      **更短前缀**的路由，也可能变得不可达；
+    - `results` 严格保持 `targets` 输入顺序，每项给出 `before`、`after` 与
+      `impact`：
+      - `unchanged`：故障前后结果完全一致（目标本就不经过故障下一跳）；
+      - `ecmp_reduced`：命中网段与 metric 不变，仅 ECMP 下一跳严格减少且
+        仍非空；
+      - `rerouted`：改走其他路由（网段或 metric 变化，含回退到较高 metric
+        或更短前缀）；
+      - `unreachable`：故障前可达、故障后无路由可命中；
+    - `summary` 汇总四类影响的目标数量；
+    - `failed_next_hops` 为 1～1000 个**唯一**严格 IPv4 地址，不要求确实
+      出现在 `routes` 中（全部未出现时所有目标均为 `unchanged`）；重复时
+      返回 **422** 并在 `detail.duplicates` 中列出冲突位置；
+    - routes / targets 完全沿用 /routes/resolve 的 IPv4、路由规模与目标
+      去重校验。
+    """
+    try:
+        return resolve_failover(
+            [(route.cidr, route.next_hop, route.metric) for route in request.routes],
+            list(request.targets),
+            list(request.failed_next_hops),
+        )
+    except DuplicateTargetsError as exc:
+        # 重复目标：422 并列出规范化目标与其全部出现位置
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "duplicate_targets", "duplicates": exc.duplicates},
+        ) from exc
+    except DuplicateFailedNextHopsError as exc:
+        # 重复故障下一跳：422 并列出规范化地址与其全部出现位置
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "duplicate_failed_next_hops",
+                "duplicates": exc.duplicates,
+            },
         ) from exc
     except (InvalidCIDRError, InvalidIPv4AddressError):
         # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
